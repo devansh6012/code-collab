@@ -42,40 +42,50 @@ export const setupCollaboration = (io: Server) => {
         const color = CURSOR_COLORS[colorIndex % CURSOR_COLORS.length];
         colorIndex++;
 
-        // Store user presence in Redis
+        // Check if user already has presence in this room
         const presenceKey = `presence:${roomId}:${userId}`;
+        const existingPresence = await redisClient.get(presenceKey);
+        
+        // Store user presence in Redis (always update to latest socket)
         await redisClient.setEx(presenceKey, 3600, JSON.stringify({
           userId,
           username,
-          color,
+          color: existingPresence ? JSON.parse(existingPresence).color : color,
           socketId: socket.id
         }));
 
-        // Get all users in room
+        // Get all UNIQUE users in room (by userId, not socketId)
         const presenceKeys = await redisClient.keys(`presence:${roomId}:*`);
-        const users: UserPresence[] = [];
+        const usersMap = new Map<string, UserPresence>();
         
         for (const key of presenceKeys) {
           const data = await redisClient.get(key);
           if (data) {
             const user = JSON.parse(data);
-            users.push({
-              userId: user.userId,
-              username: user.username,
-              color: user.color
-            });
+            // Only add if not already in map (prevents duplicates)
+            if (!usersMap.has(user.userId)) {
+              usersMap.set(user.userId, {
+                userId: user.userId,
+                username: user.username,
+                color: user.color
+              });
+            }
           }
         }
+
+        const users = Array.from(usersMap.values());
 
         // Send current users to new user
         socket.emit('room-users', users);
 
-        // Notify others
-        socket.to(roomId).emit('user-joined', {
-          userId,
-          username,
-          color
-        });
+        // Notify others only if this is a new user (not a reconnection)
+        if (!existingPresence) {
+          socket.to(roomId).emit('user-joined', {
+            userId,
+            username,
+            color: usersMap.get(userId)?.color
+          });
+        }
 
         // Get room files
         const files = await query(
@@ -103,18 +113,7 @@ export const setupCollaboration = (io: Server) => {
         
         if (!socketData?.roomId) return;
 
-        // Get pending operations for this file from Redis
-        const pendingKey = `pending:${fileId}`;
-        const pendingOps = await redisClient.lRange(pendingKey, 0, -1);
-        
-        // Transform operation against pending operations
-        let transformedOp = operation;
-        for (const opStr of pendingOps) {
-          const pendingOp = JSON.parse(opStr);
-          transformedOp = OperationalTransform.transform(transformedOp, pendingOp);
-        }
-
-        // Apply operation to get new content
+        // Get current file content from database
         const files = await query(
           'SELECT content FROM files WHERE id = ?',
           [fileId]
@@ -123,23 +122,24 @@ export const setupCollaboration = (io: Server) => {
         if (files.length === 0) return;
 
         const currentContent = files[0].content || '';
-        const newContent = OperationalTransform.apply(currentContent, transformedOp);
+        
+        // Apply operation to get new content
+        const newContent = OperationalTransform.apply(currentContent, operation);
 
-        // Update file in database
+        // Save to database immediately
         await query(
           'UPDATE files SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
           [newContent, fileId]
         );
 
-        // Add to pending operations (keep last 100)
-        await redisClient.rPush(pendingKey, JSON.stringify(transformedOp));
-        await redisClient.lTrim(pendingKey, -100, -1);
-        await redisClient.expire(pendingKey, 300); // 5 minutes
+        // Clear pending operations for this file from Redis after successful save
+        const pendingKey = `pending:${fileId}`;
+        await redisClient.del(pendingKey);
 
         // Broadcast to other users in room
         socket.to(socketData.roomId).emit('code-update', {
           fileId,
-          operation: transformedOp,
+          operation: operation,
           userId: socketData.userId
         });
 
@@ -284,6 +284,31 @@ export const setupCollaboration = (io: Server) => {
         }
       } catch (error) {
         console.error('Disconnect error:', error);
+      }
+    });
+
+    // Handle explicit leave-room
+    socket.on('leave-room', async (data: { roomId: string }) => {
+      try {
+        const socketData = socket.data as SocketData;
+        
+        if (socketData?.userId && data.roomId) {
+          // Remove from presence
+          await redisClient.del(`presence:${data.roomId}:${socketData.userId}`);
+
+          // Leave the socket.io room
+          socket.leave(data.roomId);
+
+          // Notify others
+          socket.to(data.roomId).emit('user-left', {
+            userId: socketData.userId,
+            username: socketData.username
+          });
+
+          console.log(`User ${socketData.username} explicitly left room ${data.roomId}`);
+        }
+      } catch (error) {
+        console.error('Leave room error:', error);
       }
     });
   });
